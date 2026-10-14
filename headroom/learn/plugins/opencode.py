@@ -71,40 +71,43 @@ def _session_table(tables: set[str]) -> str | None:
 
 
 def _extract_output(state: dict) -> str:
-    """Extract human-readable tool output from either schema shape."""
+    """Extract human-readable tool output from either schema shape.
+
+    Combines all available sources: the legacy ``state.output`` string, the
+    v2 ``state.content`` text blocks, and ``state.error`` details. The error
+    is always included when present — even alongside content blocks — so a
+    failed call keeps its failure message for error classification.
+    """
+    parts: list[str] = []
     # Legacy shape: state.output is a plain string.
     if isinstance(state.get("output"), str) and state.get("output"):
-        return str(state.get("output") or "")
+        parts.append(str(state.get("output") or ""))
     # Current shape: state.content is a list of {type, text} blocks.
     content = state.get("content")
     if isinstance(content, list) and content:
-        texts: list[str] = []
         for item in content:
             if not isinstance(item, dict):
-                texts.append(str(item))
+                parts.append(str(item))
                 continue
             t = item.get("text")
             if isinstance(t, str) and t:
-                texts.append(t)
+                parts.append(t)
             elif item.get("type") != "text":
-                texts.append(json.dumps(item)[:500])
-        if texts:
-            return "\n".join(texts)
+                parts.append(json.dumps(item)[:500])
+    elif content is not None and not isinstance(content, list):
+        parts.append(str(content))
     # Error shape: state.error = {type, message}. Surface it as output so
-    # error classification sees the message even when content is empty.
+    # error classification sees the message even when content is empty —
+    # or when content holds only pre-failure progress output.
     err = state.get("error")
     if isinstance(err, dict) and err:
         etype = str(err.get("type") or "error")
         msg = str(err.get("message") or "")
         combined = f"{etype}: {msg}".strip(": ").strip()
-        if combined:
-            return combined
-        return json.dumps(err)[:2000]
-    if isinstance(err, str) and err:
-        return err
-    if content is not None and not isinstance(content, list):
-        return str(content)
-    return ""
+        parts.append(combined if combined else json.dumps(err)[:2000])
+    elif isinstance(err, str) and err:
+        parts.append(err)
+    return "\n".join(p for p in parts if p)
 
 
 class OpenCodePlugin(LearnPlugin, ConversationScanner):
@@ -248,9 +251,15 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
         session_rows = cursor.fetchall()
 
         sessions: list[SessionData] = []
+        # The message layout follows the session schema: v2 sessions live in
+        # session_message, legacy ones in part/message. Resolve once per scan
+        # instead of per session (up to 200 sqlite_master lookups per project).
+        prefer_v2 = sess_tbl == "session_v2"
         for session_id, time_created in session_rows:
             try:
-                session = self._scan_session(conn, session_id, time_created)
+                session = self._scan_session(
+                    conn, session_id, time_created, tables=tables, prefer_v2=prefer_v2
+                )
             except sqlite3.Error as exc:
                 logger.warning("Cannot scan OpenCode session %s: %s", session_id, exc)
                 continue
@@ -287,13 +296,31 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
         conn: sqlite3.Connection,
         session_id: str,
         time_created: int | None,
+        tables: set[str] | None = None,
+        prefer_v2: bool = True,
     ) -> SessionData | None:
-        tables = _tables(conn)
+        """Scan one session, trying the matching message layout first.
+
+        ``prefer_v2`` follows the session schema the ID was discovered from.
+        When the preferred layout yields no tool calls (partially migrated
+        databases can hold both families), the other layout is tried before
+        giving up, so mixed-schema sessions don't silently lose their calls.
+        """
+        if tables is None:
+            tables = _tables(conn)
+        attempts = []
         if "session_message" in tables:
-            return self._scan_session_v2(conn, session_id, time_created)
-        if "part" in tables:
-            return self._scan_session_legacy(conn, session_id, time_created)
-        logger.warning("OpenCode DB has neither session_message nor part table")
+            attempts.append((True, self._scan_session_v2))
+        if "part" in tables and "message" in tables:
+            attempts.append((False, self._scan_session_legacy))
+        if not attempts:
+            logger.warning("OpenCode DB has neither session_message nor part/message tables")
+            return None
+        attempts.sort(key=lambda attempt: attempt[0] != prefer_v2)
+        for _, scan in attempts:
+            session = scan(conn, session_id, time_created)
+            if session is not None and session.tool_calls:
+                return session
         return None
 
     def _scan_session_v2(
@@ -320,7 +347,9 @@ class OpenCodePlugin(LearnPlugin, ConversationScanner):
                 data = json.loads(data_raw)
             except (json.JSONDecodeError, TypeError):
                 continue
-
+            # data_raw is TEXT; a stored "null"/"[]" parses to a non-dict.
+            if not isinstance(data, dict):
+                continue
             content = data.get("content")
             if not isinstance(content, list):
                 continue
