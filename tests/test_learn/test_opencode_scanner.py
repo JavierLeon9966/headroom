@@ -333,3 +333,153 @@ def test_opencode_plugin_is_discovered_by_registry() -> None:
         assert "opencode" in get_registry()
     finally:
         reset_registry()
+
+
+def _create_opencode_db_v2(
+    db_path: Path,
+    project_path: Path,
+    *,
+    project_id: str = "project-v2",
+    project_name: str | None = None,
+    session_id: str = "session-v2",
+) -> None:
+    """Build a minimal opencode v2 database (session_v2 + session_message).
+
+    Mirrors the schema shipped by current opencode releases: each
+    ``session_message`` row holds JSON ``data`` with a ``content`` list, and
+    tool entries carry ``name``/``id`` plus a ``state`` dict with
+    ``status``/``input``/``content`` (or ``error`` on failure).
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE project (
+                id TEXT PRIMARY KEY,
+                worktree TEXT NOT NULL,
+                name TEXT
+            );
+            CREATE TABLE session_v2 (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL
+            );
+            CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            """
+        )
+        # NOTE: compact separators mirror production storage (no spaces), which
+        # the scanner's LIKE prefilter matches.
+        def _dump(obj: object) -> str:
+            return json.dumps(obj, separators=(",", ":"))
+        conn.execute(
+            "INSERT INTO project (id, worktree, name) VALUES (?, ?, ?)",
+            (project_id, str(project_path), project_name),
+        )
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, time_created) VALUES (?, ?, ?)",
+            (session_id, project_id, 1_700_000_000_000),
+        )
+        conn.execute(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "message-v2-1",
+                session_id,
+                "assistant",
+                5,
+                1_700_000_000_001,
+                1_700_000_000_002,
+                _dump(
+                    {
+                        "content": [
+                            {
+                                "type": "tool",
+                                "id": "call-v2-1",
+                                "name": "read",
+                                "state": {
+                                    "status": "completed",
+                                    "input": {"path": "/repo/main.py"},
+                                    "content": [{"type": "text", "text": "print('hi')\n"}],
+                                    "metadata": {"truncated": False},
+                                },
+                            },
+                            {
+                                "type": "tool",
+                                "id": "call-v2-2",
+                                "name": "bash",
+                                "state": {
+                                    "status": "error",
+                                    "input": {"command": "pytest"},
+                                    "error": {
+                                        "type": "tool.execution",
+                                        "message": "Error: command failed with exit code 1",
+                                    },
+                                },
+                            },
+                        ]
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_opencode_plugin_v2_schema_discovers_projects_and_scans_tool_calls(
+    tmp_path: Path,
+) -> None:
+    project_path = tmp_path / "repo-v2"
+    _write_agents_file(project_path)
+    db_path = tmp_path / "opencode-v2.db"
+    _create_opencode_db_v2(db_path, project_path, project_name="V2Project")
+
+    plugin = OpenCodePlugin(db_path=db_path)
+
+    projects = plugin.discover_projects()
+    assert len(projects) == 1
+    assert projects[0].name == "V2Project"
+    assert projects[0].project_path == project_path
+
+    sessions = plugin.scan_project(projects[0])
+    assert len(sessions) == 1
+    assert sessions[0].session_id == "session-v2"
+    assert len(sessions[0].tool_calls) == 2
+
+    ok_call, err_call = sessions[0].tool_calls
+    assert ok_call.name == "read"
+    assert ok_call.is_error is False
+    assert "print('hi')" in ok_call.output
+    assert err_call.name == "Bash"
+    assert err_call.tool_call_id == "call-v2-2"
+    assert err_call.is_error is True
+    assert err_call.error_category == ErrorCategory.RUNTIME_ERROR
+
+
+def test_opencode_plugin_v2_null_project_name_falls_back_to_worktree(
+    tmp_path: Path,
+) -> None:
+    # Current opencode releases leave project.name NULL; discovery must fall
+    # back to the worktree basename instead of crashing or emitting an empty name.
+    project_path = tmp_path / "fallback-repo"
+    project_path.mkdir()
+    db_path = tmp_path / "opencode-v2-null.db"
+    _create_opencode_db_v2(db_path, project_path, project_name=None)
+
+    plugin = OpenCodePlugin(db_path=db_path)
+
+    projects = plugin.discover_projects()
+    assert len(projects) == 1
+    assert projects[0].name == "fallback-repo"
+    assert projects[0].context_file is None
+
+    sessions = plugin.scan_project(projects[0])
+    assert len(sessions) == 1
